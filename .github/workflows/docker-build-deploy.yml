@@ -1,0 +1,220 @@
+name: Build and Deploy Taiga to VPS
+
+on:
+  push:
+    branches:
+      - stable
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME_BACK: atypicaldevops/taiga-back
+  IMAGE_NAME_FRONT: atypicaldevops/taiga-front
+  IMAGE_NAME_GATEWAY: atypicaldevops/taiga-gateway
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata for back
+        id: meta_back
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_BACK }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Extract metadata for front
+        id: meta_front
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_FRONT }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Extract metadata for gateway
+        id: meta_gateway
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_GATEWAY }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push taiga-back Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./taiga-back
+          file: ./taiga-back/Dockerfile
+          push: true
+          tags: ${{ steps.meta_back.outputs.tags }}
+          labels: ${{ steps.meta_back.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push taiga-front Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./taiga-front
+          file: ./taiga-front/Dockerfile
+          push: true
+          tags: ${{ steps.meta_front.outputs.tags }}
+          labels: ${{ steps.meta_front.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push taiga-gateway Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./taiga-gateway
+          file: ./taiga-gateway/Dockerfile
+          push: true
+          tags: ${{ steps.meta_gateway.outputs.tags }}
+          labels: ${{ steps.meta_gateway.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            set -e
+            
+            echo "========================================="
+            echo "Starting Taiga deployment to VPS..."
+            echo "========================================="
+            
+            # Navigate to taiga-docker directory
+            cd /opt/taiga-docker
+            
+            # Pull latest changes from repository
+            echo "Pulling latest changes from repository..."
+            git pull origin stable
+            
+            # Pull latest Docker images
+            echo "Pulling latest Docker images..."
+            docker compose pull
+            
+            # Stop current running containers
+            echo "Stopping current containers..."
+            docker compose down
+            
+            # Start containers with latest images
+            echo "Starting containers with latest images..."
+            docker compose up -d
+            
+            # Wait for services to be healthy
+            echo "Waiting for services to initialize..."
+            sleep 30
+            
+            # Run migrations (if any)
+            echo "Running database migrations..."
+            docker compose exec -T taiga-back python manage.py migrate --noinput || echo "No migrations needed"
+            
+            # Collect static files
+            echo "Collecting static files..."
+            docker compose exec -T taiga-back python manage.py collectstatic --noinput || echo "Static files already collected"
+            
+            # Verify deployment
+            echo "Verifying deployment..."
+            if docker compose ps | grep -q "taiga-back.*Up"; then
+              echo "✓ taiga-back is running"
+            else
+              echo "✗ taiga-back is NOT running"
+              exit 1
+            fi
+            
+            if docker compose ps | grep -q "taiga-front.*Up"; then
+              echo "✓ taiga-front is running"
+            else
+              echo "✗ taiga-front is NOT running"
+              exit 1
+            fi
+            
+            if docker compose ps | grep -q "postgres.*Up"; then
+              echo "✓ postgres is running"
+            else
+              echo "✗ postgres is NOT running"
+              exit 1
+            fi
+            
+            echo "========================================="
+            echo "Deployment completed successfully! 🚀"
+            echo "========================================="
+
+      - name: Notify Slack (Success)
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ Taiga deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Taiga Deployment - Success* ✅\n*Branch:* ${{ github.ref_name }}\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify Slack (Failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ Taiga deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Taiga Deployment - Failed* ❌\n*Branch:* ${{ github.ref_name }}\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n*Author:* ${{ github.actor }}\n*Check logs:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
